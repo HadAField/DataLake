@@ -1,0 +1,217 @@
+# Vector Configuration for Security Data Lake
+# Collects logs from UDM Pro (syslog) and Docker containers
+# Normalizes to Elastic Common Schema (ECS) and writes to MinIO
+
+# =============================================================================
+# SOURCES
+# =============================================================================
+
+# Syslog source for UDM Pro
+[sources.udm_syslog]
+type = "syslog"
+address = "0.0.0.0:514"
+mode = "udp"
+
+# Also listen on TCP for reliability
+[sources.udm_syslog_tcp]
+type = "syslog"
+address = "0.0.0.0:514"
+mode = "tcp"
+
+# Docker container logs
+[sources.docker_logs]
+type = "docker_logs"
+docker_host = "/var/run/docker.sock"
+exclude_containers = ["vector", "minio-init"]
+
+# =============================================================================
+# TRANSFORMS - Parse and normalize to ECS
+# =============================================================================
+
+# Parse UDM Pro syslog messages
+[transforms.parse_udm]
+type = "remap"
+inputs = ["udm_syslog", "udm_syslog_tcp"]
+source = '''
+# Set base ECS fields
+.ecs = { "version": "8.11" }
+.event.kind = "event"
+.event.module = "udm_pro"
+
+# Map syslog fields to ECS
+.@timestamp = .timestamp ?? now()
+.host.name = .hostname ?? "udm-pro"
+.host.ip = .host ?? null
+.log.syslog.facility.code = .facility ?? null
+.log.syslog.severity.code = .severity ?? null
+.log.syslog.priority = .priority ?? null
+.message = .message ?? ""
+
+# Parse severity to log level
+if .severity != null {
+    .log.level = if .severity <= 2 { "critical" }
+        else if .severity == 3 { "error" }
+        else if .severity == 4 { "warning" }
+        else if .severity <= 6 { "info" }
+        else { "debug" }
+}
+
+# Extract source/destination IPs if present in message (common firewall log pattern)
+ip_pattern = r'SRC=(?P<src_ip>\d+\.\d+\.\d+\.\d+).*DST=(?P<dst_ip>\d+\.\d+\.\d+\.\d+)'
+match_result = parse_regex(.message, ip_pattern) ?? {}
+if match_result.src_ip != null {
+    .source.ip = match_result.src_ip
+}
+if match_result.dst_ip != null {
+    .destination.ip = match_result.dst_ip
+}
+
+# Extract ports if present
+port_pattern = r'SPT=(?P<src_port>\d+).*DPT=(?P<dst_port>\d+)'
+port_match = parse_regex(.message, port_pattern) ?? {}
+if port_match.src_port != null {
+    .source.port = to_int!(port_match.src_port)
+}
+if port_match.dst_port != null {
+    .destination.port = to_int!(port_match.dst_port)
+}
+
+# Categorize events based on syslog facility/program
+.event.category = if contains(.message, "firewall") || contains(.message, "iptables") { ["network"] }
+    else if contains(.message, "auth") || contains(.message, "login") || contains(.message, "sshd") { ["authentication"] }
+    else if contains(.message, "kernel") { ["host"] }
+    else { ["process"] }
+
+# Extract action from common patterns
+.event.action = if contains(.message, "ACCEPT") { "allowed" }
+    else if contains(.message, "DROP") || contains(.message, "REJECT") { "denied" }
+    else if contains(.message, "login") { "logon" }
+    else { null }
+
+# Add observer info (the UDM Pro itself)
+.observer.vendor = "Ubiquiti"
+.observer.product = "Dream Machine Pro"
+.observer.type = "firewall"
+
+# Add ingestion timestamp
+.event.ingested = now()
+
+# Clean up original syslog fields (keep raw for debugging)
+.log.original = encode_json({
+    "facility": .facility,
+    "severity": .severity,
+    "appname": .appname,
+    "procid": .procid,
+    "msgid": .msgid
+})
+
+# Remove redundant fields
+del(.facility)
+del(.severity)
+del(.priority)
+del(.hostname)
+del(.appname)
+del(.procid)
+del(.msgid)
+del(.host)
+del(.timestamp)
+del(.version)
+del(.source_type)
+'''
+
+# Parse Docker container logs
+[transforms.parse_docker]
+type = "remap"
+inputs = ["docker_logs"]
+source = '''
+# Set base ECS fields
+.ecs = { "version": "8.11" }
+.event.kind = "event"
+.event.module = "docker"
+.event.category = ["process"]
+
+# Map Docker fields to ECS
+.@timestamp = .timestamp ?? now()
+.container.id = .container_id ?? null
+.container.name = .container_name ?? null
+.container.image.name = .image ?? null
+.host.name = get_env_var("HOSTNAME") ?? "docker-host"
+.message = .message ?? ""
+
+# Determine log level from stream
+.log.level = if .stream == "stderr" { "error" } else { "info" }
+
+# Try to parse JSON logs (common in containerized apps)
+parsed = parse_json(.message) ?? null
+if parsed != null {
+    # If message was JSON, extract common fields
+    if parsed.level != null { .log.level = downcase!(parsed.level) }
+    if parsed.msg != null { .message = parsed.msg }
+    if parsed.error != null { .error.message = parsed.error }
+    if parsed.timestamp != null { .@timestamp = parsed.timestamp }
+}
+
+# Add ingestion timestamp
+.event.ingested = now()
+
+# Add labels as custom fields
+.labels = .label ?? {}
+
+# Clean up Docker-specific fields
+del(.container_id)
+del(.container_name)
+del(.container_created_at)
+del(.image)
+del(.stream)
+del(.label)
+del(.source_type)
+del(.timestamp)
+'''
+
+# =============================================================================
+# SINKS - Write to MinIO (S3-compatible)
+# =============================================================================
+
+[sinks.minio_udm]
+type = "aws_s3"
+inputs = ["parse_udm"]
+bucket = "security-logs"
+region = "us-east-1"
+endpoint = "http://minio:9000"
+compression = "gzip"
+encoding.codec = "json"
+key_prefix = "ecs_events/source=udm/year=%Y/month=%m/day=%d/"
+filename_time_format = "%H%M%S"
+filename_append_uuid = true
+filename_extension = "json.gz"
+batch.max_bytes = 10485760
+batch.timeout_secs = 300
+
+[sinks.minio_udm.auth]
+access_key_id = "${MINIO_ROOT_USER}"
+secret_access_key = "${MINIO_ROOT_PASSWORD}"
+
+[sinks.minio_docker]
+type = "aws_s3"
+inputs = ["parse_docker"]
+bucket = "security-logs"
+region = "us-east-1"
+endpoint = "http://minio:9000"
+compression = "gzip"
+encoding.codec = "json"
+key_prefix = "ecs_events/source=docker/year=%Y/month=%m/day=%d/"
+filename_time_format = "%H%M%S"
+filename_append_uuid = true
+filename_extension = "json.gz"
+batch.max_bytes = 10485760
+batch.timeout_secs = 300
+
+[sinks.minio_docker.auth]
+access_key_id = "${MINIO_ROOT_USER}"
+secret_access_key = "${MINIO_ROOT_PASSWORD}"
+
+# Console output for debugging (optional, can be disabled in production)
+[sinks.console]
+type = "console"
+inputs = ["parse_udm", "parse_docker"]
+encoding.codec = "json"
